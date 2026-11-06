@@ -2,3 +2,6 @@ ultralytics>=8.4.0
 opencv-python
 psutil
 numpy
+fastapi
+uvicorn
+python-multipart

@@ -204,7 +204,7 @@ def make_mosaic(paths: list[Path], out_path: Path, tile_w: int = 640, tile_h: in
                     ox, oy = x0 + (tile_w - fw) // 2, y0 + (tile_h - fh) // 2
                     canvas[oy:oy + fh, ox:ox + fw] = cv2.resize(frame, (fw, fh), interpolation=cv2.INTER_AREA)
                 else:
-                    cv2.putText(canvas, "termine", (x0 + tile_w // 2 - 50, y0 + tile_h // 2),
+                    cv2.putText(canvas, "done", (x0 + tile_w // 2 - 50, y0 + tile_h // 2),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (120, 120, 120), 2, cv2.LINE_AA)
                 # stream name at the bottom of each tile + thin border
                 cv2.rectangle(canvas, (x0, y0 + tile_h - 26), (x0 + tile_w, y0 + tile_h), (0, 0, 0), -1)

@@ -1,20 +1,20 @@
-"""Benchmark yolo26n : combien de vidéos (flux) peut-on traiter en parallèle sur ce PC ?
+"""yolo26n benchmark: how many videos (streams) can this PC process in parallel?
 
-Pour N = 1, 2, 3 ... flux en parallèle (1 process par flux), on mesure pendant `--duration` secondes :
-  - FPS par flux (moyen / minimum) et FPS total
-  - latence d'inférence (moyenne, p95)
-  - CPU (moyen / max, par cœur)
-  - RAM : mémoire des process YOLO (total + par flux) et RAM système
+For N = 1, 2, 3 ... parallel streams (1 process per stream), measures for `--duration` seconds:
+  - FPS per stream (average / minimum) and total FPS
+  - inference latency (average, p95)
+  - CPU (average / max, per core)
+  - RAM: memory of the YOLO processes (total + per stream) and system RAM
 
-Résultat :
-  - nombre max de flux en TEMPS RÉEL (FPS de chaque flux >= FPS cible, par défaut le FPS de la vidéo)
-  - N qui donne le meilleur débit total
-  - rapport JSON + CSV + graphique PNG dans reports/
+Output:
+  - max number of REAL-TIME streams (every stream FPS >= target FPS, default: the video FPS)
+  - N giving the best total throughput
+  - JSON + CSV report and PNG chart in reports/
 
-Exemples :
-  python benchmark.py                                  # yolo26n, 640, N = 1..2x cœurs
-  python benchmark.py --target-fps 5                   # "temps réel" = 5 FPS par flux
-  python benchmark.py --imgsz 320 640                  # compare deux tailles d'image
+Examples:
+  python benchmark.py                                  # yolo26n, 640, N = 1..2x cores
+  python benchmark.py --target-fps 5                   # "real time" = 5 FPS per stream
+  python benchmark.py --imgsz 320 640                  # compare two image sizes
   python benchmark.py --streams 1 2 4 6 8 --duration 30
 """
 from __future__ import annotations
@@ -38,7 +38,7 @@ from common import MODEL_NAME, PERSON_CLASS_ID, ROOT, list_videos, load_model
 MB = 1024 ** 2
 
 
-# ----------------------------------------------------------------------------- worker (1 flux vidéo)
+# ----------------------------------------------------------------------------- worker (1 video stream)
 def stream_worker(wid, cores, threads, cfg, ready_q, start_ev, result_q):
     for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ[var] = str(threads)
@@ -58,7 +58,7 @@ def stream_worker(wid, cores, threads, cfg, ready_q, start_ev, result_q):
     model.predict(np.zeros((cfg["imgsz"], cfg["imgsz"], 3), np.uint8), imgsz=cfg["imgsz"], device="cpu", verbose=False)
 
     cap = cv2.VideoCapture(cfg["video"])
-    # chaque flux démarre à un endroit différent de la vidéo (plus réaliste)
+    # each stream starts at a different position in the video (more realistic)
     n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
     cap.set(cv2.CAP_PROP_POS_FRAMES, (wid * 97) % n_frames)
 
@@ -71,7 +71,7 @@ def stream_worker(wid, cores, threads, cfg, ready_q, start_ev, result_q):
     end = t0 + cfg["duration"]
     while time.perf_counter() < end:
         ok, frame = cap.read()
-        if not ok:  # boucle sur la vidéo
+        if not ok:  # loop the video
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             ok, frame = cap.read()
             if not ok:
@@ -89,7 +89,7 @@ def stream_worker(wid, cores, threads, cfg, ready_q, start_ev, result_q):
 
 # ----------------------------------------------------------------------------- helpers
 def plan_cores(n: int, n_cores: int, threads_opt: str, pin: bool):
-    """Retourne (threads par flux, liste des cœurs de chaque flux)."""
+    """Return (threads per stream, list of cores for each stream)."""
     if threads_opt == "auto":
         threads = max(1, n_cores // n)
     else:
@@ -122,7 +122,7 @@ def percentile(vals, p):
 
 
 def run_level(n, cfg, args, n_cores, ctx):
-    """Lance n flux en parallèle et mesure. Retourne un dict de métriques."""
+    """Run n streams in parallel and measure. Returns a dict of metrics."""
     threads, core_plan = plan_cores(n, n_cores, args.threads, not args.no_pin)
     ready_q, result_q = ctx.Queue(), ctx.Queue()
     start_ev = ctx.Event()
@@ -140,13 +140,13 @@ def run_level(n, cfg, args, n_cores, ctx):
                 pids.append(ready_q.get(timeout=5)[1])
             except queue.Empty:
                 if not all(p.is_alive() for p in procs):
-                    aborted = "un process a planté pendant le chargement (RAM ?)"
+                    aborted = "a process crashed while loading (RAM?)"
                     break
                 if time.perf_counter() - t_load > 300:
-                    aborted = "timeout chargement"
+                    aborted = "loading timeout"
                     break
                 if psutil.virtual_memory().percent > args.max_ram:
-                    aborted = f"RAM > {args.max_ram}% pendant le chargement"
+                    aborted = f"RAM > {args.max_ram}% while loading"
                     break
         load_time = time.perf_counter() - t_load
         ram_loaded = rss_of(pids)
@@ -171,16 +171,16 @@ def run_level(n, cfg, args, n_cores, ctx):
                     except queue.Empty:
                         break
                 if vm.percent > args.max_ram:
-                    aborted = f"RAM système > {args.max_ram}%"
+                    aborted = f"system RAM > {args.max_ram}%"
                     break
                 if time.perf_counter() - t0 > cfg["duration"] + 120:
-                    aborted = "timeout mesure"
+                    aborted = "measurement timeout"
                     break
                 if len(results) < n and not any(p.is_alive() for p in procs):
                     try:
                         results.append(result_q.get(timeout=2))
                     except queue.Empty:
-                        aborted = "un process a planté"
+                        aborted = "a process crashed"
                         break
     finally:
         for p in procs:
@@ -197,7 +197,7 @@ def run_level(n, cfg, args, n_cores, ctx):
     if aborted or not results:
         return m
 
-    # On ignore les 15 % premiers échantillons CPU (montée en charge)
+    # Skip the first ~15% CPU samples (ramp-up)
     skip = len(cpu_samples) // 7
     cpu_s = cpu_samples[skip:] or cpu_samples
     fps_list = [r["frames"] / r["elapsed"] for r in results if r["elapsed"] > 0]
@@ -234,10 +234,10 @@ def make_chart(configs: list[dict], target_fps: float, path: Path, title: str):
     INK, INK2, GRID, SURF = "#0b0b0b", "#52514e", "#e4e3df", "#fcfcfb"
     SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
 
-    panels = [("fps_per_stream_min", "FPS par flux (le plus lent)", True),
-              ("fps_total", "FPS total (tous les flux)", False),
-              ("cpu_avg_pct", "CPU moyen (%)", False),
-              ("ram_peak_mb", "RAM des process YOLO (Mo)", False)]
+    panels = [("fps_per_stream_min", "FPS per stream (slowest)", True),
+              ("fps_total", "Total FPS (all streams)", False),
+              ("cpu_avg_pct", "Average CPU (%)", False),
+              ("ram_peak_mb", "YOLO processes RAM (MB)", False)]
     fig, axes = plt.subplots(2, 2, figsize=(12, 8), facecolor=SURF)
     for ax, (key, label, show_target) in zip(axes.flat, panels):
         ax.set_facecolor(SURF)
@@ -248,19 +248,19 @@ def make_chart(configs: list[dict], target_fps: float, path: Path, title: str):
             xs, ys = zip(*pts)
             ax.plot(xs, ys, color=SERIES[i % len(SERIES)], lw=2, marker="o", ms=8,
                     markeredgecolor=SURF, markeredgewidth=2, label=c["name"], zorder=3)
-            if len(configs) == 1:  # label direct sur le dernier point
+            if len(configs) == 1:  # direct label on the last point
                 ax.annotate(f"{ys[-1]:g}", (xs[-1], ys[-1]), textcoords="offset points", xytext=(6, 6),
                             color=INK2, fontsize=9)
         if show_target:
             ax.axhline(target_fps, color=INK2, lw=1, ls="--", zorder=2)
-            ax.annotate(f"temps réel = {target_fps:g} FPS", xy=(0.01, target_fps), xycoords=("axes fraction", "data"),
+            ax.annotate(f"real time = {target_fps:g} FPS", xy=(0.01, target_fps), xycoords=("axes fraction", "data"),
                         xytext=(0, 4), textcoords="offset points", color=INK2, fontsize=9)
         if key == "cpu_avg_pct":
             ax.set_ylim(0, 105)
         else:
             ax.set_ylim(bottom=0)
         ax.set_title(label, loc="left", color=INK, fontsize=11, fontweight="bold")
-        ax.set_xlabel("Nombre de vidéos en parallèle", color=INK2, fontsize=9)
+        ax.set_xlabel("Number of parallel videos", color=INK2, fontsize=9)
         ax.grid(axis="y", color=GRID, lw=0.8)
         ax.set_axisbelow(True)
         for s in ("top", "right"):
@@ -287,25 +287,25 @@ def main():
     except Exception:
         pass
     n_cores = psutil.cpu_count(logical=True)
-    ap = argparse.ArgumentParser(description="yolo26n : combien de vidéos en parallèle ?")
-    ap.add_argument("--video", type=Path, help="vidéo de test (défaut : 1re vidéo de input_videos)")
+    ap = argparse.ArgumentParser(description="yolo26n: how many videos in parallel?")
+    ap.add_argument("--video", type=Path, help="test video (default: first video in input_videos)")
     ap.add_argument("--imgsz", nargs="+", type=int, default=[640], help="ex: 320 640")
-    ap.add_argument("--streams", nargs="+", type=int, help=f"valeurs de N (défaut : 1..{n_cores * 2})")
-    ap.add_argument("--duration", type=float, default=20, help="secondes de mesure par palier")
-    ap.add_argument("--threads", default="auto", help="threads par flux : 'auto' (= cœurs / N) ou un nombre")
-    ap.add_argument("--target-fps", type=float, help="FPS 'temps réel' par flux (défaut : FPS de la vidéo)")
-    ap.add_argument("--max-ram", type=float, default=92, help="arrête si la RAM système dépasse ce %%")
+    ap.add_argument("--streams", nargs="+", type=int, help=f"values of N (default: 1..{n_cores * 2})")
+    ap.add_argument("--duration", type=float, default=20, help="measurement seconds per level")
+    ap.add_argument("--threads", default="auto", help="threads per stream: 'auto' (= cores / N) or a number")
+    ap.add_argument("--target-fps", type=float, help="'real time' FPS per stream (default: video FPS)")
+    ap.add_argument("--max-ram", type=float, default=92, help="stop if system RAM exceeds this %%")
     ap.add_argument("--conf", type=float, default=0.25)
     ap.add_argument("--persons-only", action="store_true")
-    ap.add_argument("--no-pin", action="store_true", help="ne pas fixer les process sur des cœurs")
+    ap.add_argument("--no-pin", action="store_true", help="do not pin processes to cores")
     ap.add_argument("--keep-going", action="store_true",
-                    help="continuer même quand le débit total baisse (par défaut : arrêt après 2 baisses)")
+                    help="keep going even when total throughput drops (default: stop after 2 drops)")
     ap.add_argument("--reports", type=Path, default=ROOT / "reports")
     a = ap.parse_args()
 
     video = a.video or next(iter(list_videos(ROOT / "input_videos")), None)
     if not video or not Path(video).exists():
-        print("Aucune vidéo : mettez une vidéo dans input_videos/ ou utilisez --video")
+        print("No video: put a video in input_videos/ or use --video")
         return
 
     import cv2
@@ -324,52 +324,52 @@ def main():
                "ram_total_gb": round(vm.total / 1024 ** 3, 1), "ram_available_gb": round(vm.available / 1024 ** 3, 1)}
 
     print("=" * 78)
-    print(" BENCHMARK yolo26n : combien de vidéos en parallèle ?")
+    print(" BENCHMARK yolo26n: how many videos in parallel?")
     print("=" * 78)
-    print(f"  CPU   : {sysinfo['processor']}  ({n_cores} logiques / {sysinfo['physical_cores']} physiques)")
-    print(f"  RAM   : {sysinfo['ram_total_gb']} Go total, {sysinfo['ram_available_gb']} Go libres")
-    print(f"  Vidéo : {Path(video).name}  {vres} @ {vfps:.1f} FPS")
-    print(f"  Temps réel = {target:g} FPS par flux | paliers N = {levels} | {a.duration:g}s par palier")
+    print(f"  CPU   : {sysinfo['processor']}  ({n_cores} logical / {sysinfo['physical_cores']} physical)")
+    print(f"  RAM   : {sysinfo['ram_total_gb']} GB total, {sysinfo['ram_available_gb']} GB free")
+    print(f"  Video : {Path(video).name}  {vres} @ {vfps:.1f} FPS")
+    print(f"  Real time = {target:g} FPS per stream | levels N = {levels} | {a.duration:g}s per level")
 
     ctx = mp.get_context("spawn")
     all_configs = []
 
-    load_model()  # téléchargement unique, avant de lancer les process
+    load_model()  # download once, before starting the processes
     for imgsz in a.imgsz:
         name = f"{MODEL_NAME} @ {imgsz}"
         cfg = {"imgsz": imgsz, "conf": a.conf, "video": str(video),
                "classes": [PERSON_CLASS_ID] if a.persons_only else None,
                "duration": a.duration, "target_fps": target}
         print(f"\n--- {name} " + "-" * (70 - len(name)))
-        print(f"{'N':>3} {'thr':>3} {'FPS/flux':>9} {'min':>6} {'FPS tot':>8} {'lat ms':>7} {'p95':>6} "
-              f"{'CPU%':>5} {'RAM Mo':>7} {'Mo/flux':>7} {'RAM sys':>7}  temps réel")
+        print(f"{'N':>3} {'thr':>3} {'FPS/strm':>9} {'min':>6} {'FPS tot':>8} {'lat ms':>7} {'p95':>6} "
+              f"{'CPU%':>5} {'RAM MB':>7} {'MB/strm':>7} {'RAM sys':>7}  real time")
         res = []
-        per_stream_mb = 440  # estimation avant la 1re mesure
+        per_stream_mb = 440  # estimate before the first measurement
         best_total, drops = 0.0, 0
         for n in levels:
             avail_mb = psutil.virtual_memory().available / MB
             if n * per_stream_mb > avail_mb * 0.9:
-                print(f"{n:>3}  stop : RAM insuffisante (besoin ~{n * per_stream_mb:.0f} Mo, "
-                      f"libre {avail_mb:.0f} Mo)")
-                res.append({"streams": n, "aborted": "RAM insuffisante (estimation)"})
+                print(f"{n:>3}  stop: not enough RAM (need ~{n * per_stream_mb:.0f} MB, "
+                      f"free {avail_mb:.0f} MB)")
+                res.append({"streams": n, "aborted": "not enough RAM (estimate)"})
                 break
             m = run_level(n, cfg, a, n_cores, ctx)
             res.append(m)
             if m.get("aborted"):
-                print(f"{n:>3}  stop : {m['aborted']}")
+                print(f"{n:>3}  stop: {m['aborted']}")
                 break
             per_stream_mb = m["ram_peak_per_stream_mb"] or per_stream_mb
             print(f"{n:>3} {m['threads_per_stream']:>3} {m['fps_per_stream_avg']:>9.2f} "
                   f"{m['fps_per_stream_min']:>6.2f} {m['fps_total']:>8.2f} {m['latency_avg_ms']:>7.0f} "
                   f"{m['latency_p95_ms']:>6.0f} {m['cpu_avg_pct']:>5.0f} {m['ram_peak_mb']:>7} "
                   f"{m['ram_peak_per_stream_mb']:>7} {m['sys_ram_peak_pct']:>6.0f}%  "
-                  f"{'OUI' if m['realtime'] else 'non'}", flush=True)
+                  f"{'YES' if m['realtime'] else 'no'}", flush=True)
             if m["fps_total"] > best_total:
                 best_total, drops = m["fps_total"], 0
             else:
                 drops += 1
                 if drops >= 2 and not a.keep_going:
-                    print("     stop : le débit total ne monte plus (CPU saturé). --keep-going pour continuer")
+                    print("     stop: total throughput no longer increases (CPU saturated). Use --keep-going to continue")
                     break
 
         ok = [r for r in res if "fps_total" in r]
@@ -385,21 +385,21 @@ def main():
         }
         all_configs.append({"name": name, "model": MODEL_NAME, "imgsz": imgsz, "levels": res, "summary": summary})
 
-    # ----- résumé
+    # ----- summary
     print("\n" + "=" * 78)
-    print(f" RÉSUMÉ  (temps réel = {target:g} FPS par flux)")
+    print(f" SUMMARY  (real time = {target:g} FPS per stream)")
     print("=" * 78)
     for c in all_configs:
         s = c["summary"]
         print(f"\n  {c['name']}")
-        print(f"    Flux en temps réel (max)        : {s['max_realtime_streams']}")
-        print(f"    Meilleur débit total            : {s['best_fps_total']} FPS avec {s['best_throughput_streams']} flux")
-        print(f"    Capacité théorique à {target:g} FPS     : {s['theoretical_streams_at_target']} flux "
-              f"(= débit total / FPS cible)")
-        print(f"    RAM par flux                    : ~{s['ram_per_stream_mb']} Mo")
+        print(f"    Real-time streams (max)         : {s['max_realtime_streams']}")
+        print(f"    Best total throughput           : {s['best_fps_total']} FPS with {s['best_throughput_streams']} streams")
+        print(f"    Theoretical capacity at {target:g} FPS : {s['theoretical_streams_at_target']} streams "
+              f"(= total throughput / target FPS)")
+        print(f"    RAM per stream                  : ~{s['ram_per_stream_mb']} MB")
         if s["max_realtime_streams"] == 0 and s["best_fps_total"]:
-            print(f"    -> Même 1 flux n'atteint pas {target:g} FPS. Essayez --imgsz 320, "
-                  f"ou --target-fps plus bas (ex. traiter 1 image sur 2).")
+            print(f"    -> Even 1 stream does not reach {target:g} FPS. Try --imgsz 320, "
+                  f"or a lower --target-fps (e.g. process 1 frame out of 2).")
 
     a.reports.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -421,12 +421,12 @@ def main():
 
     try:
         make_chart(all_configs, target, base.with_suffix(".png"),
-                   f"{MODEL_NAME} sur {n_cores} cœurs : vidéos en parallèle ({Path(video).name}, {vres})")
-        print(f"\nGraphique : {base.with_suffix('.png')}")
+                   f"{MODEL_NAME} on {n_cores} cores: parallel videos ({Path(video).name}, {vres})")
+        print(f"\nChart  : {base.with_suffix('.png')}")
     except Exception as e:
-        print(f"\n(graphique non généré : {e})")
-    print(f"Rapport   : {base.with_suffix('.json')}")
-    print(f"CSV       : {base.with_suffix('.csv')}")
+        print(f"\n(chart not generated: {e})")
+    print(f"Report : {base.with_suffix('.json')}")
+    print(f"CSV    : {base.with_suffix('.csv')}")
 
 
 if __name__ == "__main__":
