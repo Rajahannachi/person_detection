@@ -1,23 +1,17 @@
 """CPU stress test with yolo26n.
 
 - Reads the number of CPU cores (logical + physical).
-- Starts ONE process per core, pins each process to its own core (CPU affinity),
-  limits it to 1 thread, and runs yolo26n inference in parallel on all cores.
+- Starts ONE process per video: ALL videos are processed at the same time.
+  Each process is pinned to a core (CPU affinity) and limited to 1 thread by default.
+  If there are more videos than cores, several videos share a core (each one slower).
 - Reads videos from input_videos/, writes annotated videos (boxes) to output_videos/.
 - Monitors per-core CPU usage + RAM live, and saves a JSON/CSV report to reports/.
 
-Modes (a video is NEVER cut into pieces: one worker always processes a whole video):
-  parallel   : (default) 1 worker per video, ALL videos start at the same time.
-               Workers are spread over the cores (2 videos per core if videos > cores).
-  split      : N workers (= cores) take videos from a queue; extra videos wait their turn.
-  replicate  : every worker processes every video -> max load, good for benchmarking.
-
 Examples:
-  python stress_test.py                              # all videos at the same time (1 worker / video)
-  python stress_test.py --mode split                 # 1 worker per core, videos queued
-  python stress_test.py --mode replicate             # every core runs every video
-  python stress_test.py --mode replicate --duration 120 --no-save   # pure 2-min stress
-  python stress_test.py --workers 2 --persons-only
+  python stress_test.py                              # all videos at the same time
+  python stress_test.py --streams 8                  # simulate 8 cameras (videos duplicated)
+  python stress_test.py --duration 120 --no-save     # 2-min stress, no output videos
+  python stress_test.py --threads 2 --persons-only
 """
 from __future__ import annotations
 
@@ -38,7 +32,8 @@ from common import MODEL_NAME, PERSON_CLASS_ID, ROOT, list_videos, load_model
 
 
 # ----------------------------------------------------------------------------- worker
-def worker(worker_id: int, core_id: int | None, args: dict, jobs, results, start_event, ready_queue):
+def worker(worker_id: int, core_id: int | None, args: dict, item: tuple[str, str], results, start_event, ready_queue):
+    """Process ONE whole video. item = (video path, stream name)."""
     # Limit threads BEFORE importing torch so each process really uses a single core
     n = str(args["threads"])
     for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
@@ -69,43 +64,20 @@ def worker(worker_id: int, core_id: int | None, args: dict, jobs, results, start
     start_event.wait()
 
     deadline = time.perf_counter() + args["duration"] if args["duration"] else None
-    output_dir = Path(args["output"])
+    video, label = Path(item[0]), item[1]  # duplicated videos get different names (cam1, cam2 ...)
+    out_path = Path(args["output"]) / f"{label}_detected.mp4" if args["save"] else None
+
     my_stats = []
-    seen = set()
-
-    while True:
-        if deadline is not None and time.perf_counter() >= deadline:
-            break
-        try:
-            # get_nowait() is unreliable on mp.Queue (can return Empty while items exist)
-            item = jobs.get(timeout=1.0)
-        except queue.Empty:
-            break
-        # a job = (video path, stream name). Duplicated videos get different names (cam1, cam2 ...)
-        video, label = Path(item[0]), item[1]
-
-        out_path = None
-        if args["save"] and label not in seen:  # save only first pass when looping
-            suffix = "detected" if args["mode"] != "replicate" else f"core{core_id if core_id is not None else worker_id}"
-            out_path = output_dir / f"{label}_{suffix}.mp4"
-        seen.add(label)
-
-        job_tag = f"{label} | {tag}"
-        print(f"[{tag}] start {label} ({video.name})", flush=True)
-        try:
-            st = process_video(model, video, out_path, conf=args["conf"], imgsz=args["imgsz"],
-                               classes=args["classes"], deadline=deadline, tag=job_tag,
-                               progress_every=args["progress_every"])
-        except Exception as e:
-            print(f"[{tag}] ERROR on {label}: {e}", flush=True)
-            continue
+    print(f"[{tag}] start {label} ({video.name})", flush=True)
+    try:
+        st = process_video(model, video, out_path, conf=args["conf"], imgsz=args["imgsz"],
+                           classes=args["classes"], deadline=deadline, tag=f"{label} | {tag}",
+                           progress_every=args["progress_every"])
         st.update(worker=worker_id, core=core_id, stream=label)
         my_stats.append(st)
         print(f"[{tag}] done {label}: {st['frames']} frames @ {st['fps']} FPS", flush=True)
-
-        # in duration mode keep looping over the same video(s)
-        if deadline is not None and args["mode"] == "replicate":
-            jobs.put(item)
+    except Exception as e:
+        print(f"[{tag}] ERROR on {label}: {e}", flush=True)
 
     results.put({"worker": worker_id, "core": core_id, "runs": my_stats})
 
@@ -135,11 +107,7 @@ def main():
     ap.add_argument("--input", default=ROOT / "input_videos", type=Path)
     ap.add_argument("--output", default=ROOT / "output_videos", type=Path)
     ap.add_argument("--reports", default=ROOT / "reports", type=Path)
-    ap.add_argument("--workers", type=int, default=None,
-                    help="parallel processes (default: parallel = 1 per video, split/replicate = 1 per core)")
-    ap.add_argument("--threads", type=int, default=1, help="torch threads per worker")
-    ap.add_argument("--mode", choices=["parallel", "split", "replicate"], default="parallel",
-                    help="parallel = all videos at the same time, 1 worker per video (default)")
+    ap.add_argument("--threads", type=int, default=1, help="torch threads per worker (1 worker = 1 video)")
     ap.add_argument("--streams", type=int, default=0,
                     help="total number of videos to run, duplicating the input videos "
                          "(ex: 2 videos + --streams 6 -> each video 3 times, named _cam1.._cam6). 0 = no duplication")
@@ -173,19 +141,13 @@ def main():
     else:
         items = [(str(v), v.stem) for v in videos]
 
-    if a.mode == "parallel":
-        if a.workers and a.workers < len(items):
-            print(f"\n  NOTE: mode parallel -> only the first {a.workers} videos are used (--workers {a.workers})")
-            items = items[:a.workers]
-        n_workers = len(items)
-    else:
-        n_workers = max(1, a.workers or info["logical_cores"])
+    n_workers = len(items)  # 1 worker per video, all at the same time
     pin = not a.no_pin
     cores = list(range(info["logical_cores"]))
     print(f"\n  input videos   : {len(videos)} -> {', '.join(v.name for v in videos)}")
     if a.streams > 0:
         print(f"  streams        : {len(items)} (duplicated) -> {', '.join(label for _, label in items)}")
-    print(f"  workers        : {n_workers} x {a.threads} thread(s), pinned={pin}, mode={a.mode}")
+    print(f"  workers        : {n_workers} x {a.threads} thread(s), pinned={pin}")
     if n_workers > len(cores):
         print(f"  NOTE           : {n_workers} workers > {len(cores)} cores -> some cores run 2+ videos "
               f"(each one slower). Expect ~{440 * n_workers / 1024:.1f} GB of RAM.")
@@ -201,37 +163,17 @@ def main():
     ready = ctx.Queue()
     start_event = ctx.Event()
 
-    # job queues: parallel = 1 video per worker, split = one shared queue, replicate = all videos per worker
-    if a.mode == "parallel":
-        job_queues = []
-        for it in items:
-            q = ctx.Queue()
-            q.put(it)
-            job_queues.append(q)
-    elif a.mode == "split":
-        shared = ctx.Queue()
-        for it in items:
-            shared.put(it)
-        job_queues = [shared] * n_workers
-    else:
-        job_queues = []
-        for _ in range(n_workers):
-            q = ctx.Queue()
-            for it in items:
-                q.put(it)
-            job_queues.append(q)
-
     args = {
         "threads": a.threads, "imgsz": a.imgsz, "conf": a.conf,
         "classes": [PERSON_CLASS_ID] if a.persons_only else None, "duration": a.duration,
-        "output": str(a.output), "save": not a.no_save, "mode": a.mode,
+        "output": str(a.output), "save": not a.no_save,
         "progress_every": a.progress_every,
     }
 
     procs = []
     for i in range(n_workers):
         core = cores[i % len(cores)] if pin else None
-        p = ctx.Process(target=worker, args=(i, core, args, job_queues[i], results, start_event, ready),
+        p = ctx.Process(target=worker, args=(i, core, args, items[i], results, start_event, ready),
                         name=f"yolo-worker-{i}")
         p.start()
         procs.append(p)

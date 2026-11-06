@@ -28,7 +28,7 @@ Videos to process go in `input_videos/`.
 | Command | Purpose | Output |
 |---|---|---|
 | `python detect.py` | runs detection on every video | `output_videos/` |
-| `python stress_test.py` | runs yolo26n on all CPU cores in parallel | `reports/` |
+| `python stress_test.py` | processes all videos at the same time (1 process per video) | `output_videos/`, `reports/` |
 | `python benchmark.py` | measures how many videos can run at the same time | `reports/` |
 
 Useful options:
@@ -36,8 +36,8 @@ Useful options:
 ```bash
 python detect.py --persons-only --conf 0.4
 
-python stress_test.py --mode replicate --duration 120   # full load for 2 min
-python stress_test.py --streams 8                       # simulate 8 cameras
+python stress_test.py --streams 8                  # simulate 8 cameras
+python stress_test.py --duration 120 --no-save     # stop after 2 min, no output videos
 
 python benchmark.py --target-fps 5
 ```
